@@ -1206,18 +1206,21 @@ class PregelLoop:
             self._push_graph_lifecycle_event("resume")
         return updated_channels
 
-    def _put_checkpoint(self, metadata: CheckpointMetadata) -> None:
-        # `is` (object identity) — not `==`. Three of four call sites pass a
-        # fresh dict ({"source":"input"|"loop"|"fork"}); only
-        # `_suppress_interrupt`(will rename to _on_loop_exit soon)
-        # at exit reuses the existing `self.checkpoint_metadata` instance. So
-        # `metadata is self.checkpoint_metadata` is True only on the exit call,
-        # which is what we use to gate exit-only behaviour (skip count-bump,
-        # don't replace metadata). Could be replaced by an explicit
-        # `exiting: bool = False` parameter; left as-is to match the existing
-        # idiom in this file.
-        # TODO: replace with an explicit `exiting: bool = False` parameter.
-        exiting = metadata is self.checkpoint_metadata
+    def _put_checkpoint(
+        self, metadata: CheckpointMetadata, *, exiting: bool = False
+    ) -> None:
+        """Write a checkpoint. `exiting=True` marks the loop-teardown write
+        under durability='exit'."""
+        # Three call sites pass a fresh dict ({"source":"input"|"loop"|"fork"})
+        # with `exiting` left at its default. Only the teardown write from
+        # `_suppress_interrupt` passes `exiting=True`; that flag gates the
+        # exit-only behaviour under durability='exit' — commit the durable
+        # state at teardown: force the checkpoint save, reuse the current
+        # checkpoint id, skip the step bump and keep the retained metadata
+        # instead of replacing it with the caller's dict. Exit mode was
+        # previously gated by object identity (`metadata is
+        # self.checkpoint_metadata`); it is now signaled explicitly via
+        # `exiting=True`.
         if exiting and self.checkpoint["id"] == self.checkpoint_id_saved:
             # checkpoint already saved
             return
@@ -1231,7 +1234,7 @@ class PregelLoop:
         # metadata dict (source="input"|"loop"|"fork") — those are the
         # intermediate calls that bump counters. In exit mode,
         # `_suppress_interrupt`(will rename to _on_loop_exit soon)
-        # additionally calls `_put_checkpoint(self.checkpoint_metadata)` AT
+        # additionally calls `_put_checkpoint(self.checkpoint_metadata, exiting=True)` AT
         # EXIT to commit the final checkpoint — this runs *after* the last
         # intermediate call already counted the last superstep. So the
         # exit call must NOT bump again or it would double-count the last
@@ -1485,7 +1488,7 @@ class PregelLoop:
             or all(NS_END not in part for part in self.checkpoint_ns)
         ):
             self._put_exit_delta_writes()
-            self._put_checkpoint(self.checkpoint_metadata)
+            self._put_checkpoint(self.checkpoint_metadata, exiting=True)
             self._put_pending_writes()
         # suppress interrupt
         if isinstance(exc_value, GraphInterrupt) and not self.is_nested:

@@ -17,11 +17,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from typing_extensions import TypedDict
 
-from langgraph._internal._constants import NULL_TASK_ID
+from langgraph._internal._constants import CONF, NULL_TASK_ID
 from langgraph.channels.delta import DeltaChannel
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import _messages_delta_reducer
 from langgraph.pregel._checkpoint import exit_delta_task_id
+from langgraph.pregel._loop import PregelLoop
 from langgraph.types import Command, Durability, interrupt
 
 pytestmark = pytest.mark.anyio
@@ -655,3 +656,136 @@ def test_exit_runs_from_a_checkpoint_the_thread_moved_past_leave_its_newer_branc
     assert [s.values.get("log", []) for s in history] == [
         s.values.get("plain", []) for s in history
     ]
+
+
+# ---------------------------------------------------------------------------
+# Explicit `exiting` parameter on `_put_checkpoint` (issue #8880)
+# ---------------------------------------------------------------------------
+
+
+async def test_exit_checkpoint_persists_final_state_durability_exit() -> None:
+    """durability='exit' must leave exactly one final checkpoint whose
+    retained metadata (source + step) makes get_state work after invoke."""
+
+    class State(TypedDict):
+        value: str
+
+    def finalize(state: dict) -> dict:
+        return {"value": "done"}
+
+    saver = InMemorySaver()
+    builder = StateGraph(State)
+    builder.add_node("finalize", finalize)
+    builder.add_edge(START, "finalize")
+    graph = builder.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "exit-final-state"}}
+
+    graph.invoke({"value": "start"}, config, durability="exit")
+
+    checkpoints = list(saver.list(config))
+    assert len(checkpoints) == 1
+    final = checkpoints[0]
+    # The teardown write keeps the last superstep's metadata instead of
+    # replacing it: source stays "loop" and the step stays at 1.
+    assert final.metadata["source"] == "loop"
+    assert final.metadata["step"] == 1
+
+    state = graph.get_state(config)
+    assert state.values == {"value": "done"}
+
+
+async def test_exit_mode_not_gated_by_metadata_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The teardown write must not depend on `metadata is
+    self.checkpoint_metadata`.
+
+    Copying the metadata before the exit call (any caller that does not pass
+    the exact instance back) used to disable exit mode under
+    durability='exit': nothing was saved and get_state came back empty after
+    a successful invoke.
+    """
+
+    class State(TypedDict):
+        value: str
+
+    def finalize(state: dict) -> dict:
+        return {"value": "done"}
+
+    saver = InMemorySaver()
+    builder = StateGraph(State)
+    builder.add_node("finalize", finalize)
+    builder.add_edge(START, "finalize")
+    graph = builder.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "exit-identity-independent"}}
+
+    original = PregelLoop._put_checkpoint
+
+    def copy_metadata(self: Any, metadata: Any, **kwargs: Any) -> None:
+        original(self, dict(metadata), **kwargs)
+
+    monkeypatch.setattr(PregelLoop, "_put_checkpoint", copy_metadata)
+    graph.invoke({"value": "start"}, config, durability="exit")
+
+    state = graph.get_state(config)
+    assert state.values == {"value": "done"}
+
+
+def test_put_checkpoint_exiting_parameter_controls_exit_behavior() -> None:
+    """`exiting=True` gates the exit-mode branches on its own: the save is
+    not suppressed under durability='exit', the checkpoint id is reused and
+    the retained metadata stays put; `exiting=False` does the opposite."""
+    loop = object.__new__(PregelLoop)
+    loop.checkpoint = {
+        "v": 2,
+        "ts": "2026-01-01T00:00:00+00:00",
+        "id": "original-checkpoint-id",
+        "channel_values": {},
+        "channel_versions": {},
+        "versions_seen": {},
+    }
+    loop.checkpoint_metadata = {"source": "loop", "step": 0}
+    loop.checkpoint_id_saved = "already-saved-id"
+    loop.checkpoint_config = {CONF: {}}
+    loop.config = {CONF: {}}
+    loop.durability = "exit"
+    loop.channels = {}
+    loop.updated_channels = set()
+    loop.step = 0
+    loop.checkpoint_previous_versions = {}
+    loop.trigger_to_nodes = {}
+    loop._delta_channels_forced_snapshot = set()
+    loop._delta_write_futs = []
+    loop.checkpointer_get_next_version = None
+    submissions: list = []
+
+    def _not_none(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    def _record_submit(*args: Any, **kwargs: Any) -> None:
+        submissions.append(args)
+
+    loop._checkpointer_put_after_previous = _not_none
+    loop.submit = _record_submit
+
+    # Teardown contract: exiting=True with a fresh metadata dict.
+    retained = loop.checkpoint_metadata
+    original_id = loop.checkpoint["id"]
+    fresh_exit = {"source": "loop"}
+    loop._put_checkpoint(fresh_exit, exiting=True)
+
+    assert len(submissions) == 1  # save submitted: not suppressed
+    assert loop.checkpoint["id"] == original_id  # checkpoint id reused
+    assert loop.checkpoint_metadata is retained  # metadata not replaced
+    assert "step" not in fresh_exit  # caller's dict left alone
+    assert loop.step == 0  # no step bump on the teardown write
+
+    # Superstep contract: exiting=False keeps its behaviour even so.
+    fresh_normal = {"source": "loop"}
+    loop._put_checkpoint(fresh_normal, exiting=False)
+
+    assert len(submissions) == 1  # no second save under durability='exit'
+    assert loop.checkpoint["id"] != original_id  # new id minted
+    assert loop.checkpoint_metadata is fresh_normal  # metadata replaced
+    assert fresh_normal["step"] == 0  # step bookkeeping on the caller's dict
+    assert loop.step == 1  # step bumped

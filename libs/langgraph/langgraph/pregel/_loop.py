@@ -603,10 +603,38 @@ class PregelLoop:
                 CONFIG_KEY_CHECKPOINT_ID: self.checkpoint["id"],
             },
         )
+        pending_writes = self.checkpoint_pending_writes
+        # check if any writes are to an UntrackedValue channel
+        if any(
+            isinstance(channel, UntrackedValue) for channel in self.channels.values()
+        ):
+            untracked_ids = (
+                _untracked_value_ids(self.channels)
+                | _untracked_value_ids_from_writes(
+                    [(channel, value) for _, channel, value in pending_writes],
+                    self.specs,
+                )
+                | _untracked_value_ids_from_input(self.input, self.channels)
+            )
+            pending_writes = [
+                # sanitize UntrackedValues that are nested within Send packets
+                (
+                    task_id,
+                    channel,
+                    sanitize_untracked_values_in_send(
+                        value, self.channels, untracked_ids
+                    )
+                    if channel == TASKS and isinstance(value, Send)
+                    else value,
+                )
+                for task_id, channel, value in pending_writes
+                # dont persist UntrackedValue channel writes
+                if not isinstance(self.specs.get(channel), UntrackedValue)
+            ]
         # Writes loaded with the checkpoint are stored on it already. Saving them
         # again can file them under new indexes, and then they apply twice.
         by_task = defaultdict(list)
-        for task_id, channel, value in self.checkpoint_pending_writes:
+        for task_id, channel, value in pending_writes:
             if task_id in self._written_task_ids:
                 by_task[task_id].append((channel, value))
         # submit writes to checkpointer

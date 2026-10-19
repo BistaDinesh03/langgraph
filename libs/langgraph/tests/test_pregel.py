@@ -9442,6 +9442,55 @@ def test_send_with_untracked_value_overlapping_keys_nested(
     assert "session_resource" not in values
 
 
+def test_send_with_untracked_value_pending_writes(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Pending writes flushed at exit are sanitized as well."""
+
+    class UnserializableResource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.lock = threading.Lock()
+
+    class State(TypedDict):
+        messages: Annotated[list[str], operator.add]
+        session_resource: Annotated[UnserializableResource, UntrackedValue]
+
+    def setup_node(state: State) -> State:
+        return {
+            "messages": ["setup complete"],
+            "session_resource": UnserializableResource("test_session"),
+        }
+
+    def send_to_tool(state: State) -> Command:
+        return Command(goto=[Send("tool_node", {"state": state})])
+
+    def interrupt_node(state: State) -> State:
+        return {"messages": [interrupt("pause")]}
+
+    def tool_node(state: State) -> State:
+        return {"messages": ["tool used resource"]}
+
+    graph = StateGraph(State)
+    graph.add_node("setup", setup_node)
+    graph.add_node("send", send_to_tool)
+    graph.add_node("interrupt", interrupt_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_edge(START, "setup")
+    graph.add_edge("setup", "send")
+    graph.add_edge("setup", "interrupt")
+    graph.add_edge("send", END)
+    graph.add_edge("interrupt", END)
+    graph.add_edge("tool_node", END)
+
+    app = graph.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = app.invoke({}, config, durability="exit")
+
+    assert "__interrupt__" in result
+    assert "session_resource" not in app.get_state(config).values
+
+
 @pytest.mark.parametrize("as_json", [False, True])
 def test_overwrite_sequential(
     sync_checkpointer: BaseCheckpointSaver, as_json: bool

@@ -1438,22 +1438,128 @@ class LazyAtomicCounter:
         return self._counter()
 
 
+_REMOVED = object()
+
+
+def _untracked_value_ids(channels: Mapping[str, BaseChannel]) -> set[int]:
+    """Return the ids of the current values of all UntrackedValue channels."""
+    return {
+        id(channel.value)
+        for channel in channels.values()
+        if isinstance(channel, UntrackedValue) and channel.is_available()
+    }
+
+
+def _untracked_value_ids_from_writes(
+    writes: Sequence[tuple[str, Any]],
+    specs: Mapping[str, Any],
+) -> set[int]:
+    """Ids of values written to UntrackedValue channels by the current task.
+
+    A Send may be produced in the same superstep that first writes the untracked
+    value, before it is applied to the channel, so the live channels alone do not
+    identify it.
+    """
+    return {
+        id(value)
+        for channel, value in writes
+        if isinstance(specs.get(channel), UntrackedValue)
+    }
+
+
+def _strip_untracked(value: Any, untracked_ids: set[int], memo: dict[int, Any]) -> Any:
+    """Recursively remove values belonging to UntrackedValue channels.
+
+    Values are matched by identity rather than by key name: a nested mapping may
+    legitimately reuse the name of an UntrackedValue channel without holding that
+    channel's live value. Containers are only copied when something is actually
+    removed, and ``memo`` keeps shared references and cycles intact.
+
+    Returns ``_REMOVED`` if ``value`` itself belongs to an UntrackedValue channel.
+    """
+    if not untracked_ids:
+        return value
+    if id(value) in untracked_ids:
+        return _REMOVED
+    if isinstance(value, dict):
+        if id(value) in memo:
+            return memo[id(value)]
+        result: dict[Any, Any] = {}
+        memo[id(value)] = result
+        changed = False
+        for key, item in value.items():
+            stripped = _strip_untracked(item, untracked_ids, memo)
+            if stripped is _REMOVED:
+                changed = True
+                continue
+            result[key] = stripped
+            changed = changed or stripped is not item
+        if changed:
+            return result
+        memo[id(value)] = value
+        return value
+    if isinstance(value, list):
+        if id(value) in memo:
+            return memo[id(value)]
+        items: list[Any] = []
+        memo[id(value)] = items
+        changed = False
+        for item in value:
+            stripped = _strip_untracked(item, untracked_ids, memo)
+            if stripped is _REMOVED:
+                changed = True
+                continue
+            items.append(stripped)
+            changed = changed or stripped is not item
+        if changed:
+            return items
+        memo[id(value)] = value
+        return value
+    if isinstance(value, tuple):
+        items = [_strip_untracked(item, untracked_ids, memo) for item in value]
+        if all(stripped is item for stripped, item in zip(items, value)):
+            return value
+        return tuple(item for item in items if item is not _REMOVED)
+    if isinstance(value, (set, frozenset)):
+        items = [_strip_untracked(item, untracked_ids, memo) for item in value]
+        kept = [item for item in items if item is not _REMOVED]
+        if len(kept) == len(items):
+            return value
+        return type(value)(kept)
+    return value
+
+
+def _sanitize_untracked_value(value: Any, untracked_ids: set[int]) -> Any:
+    """Strip untracked values from ``value``, keeping it if it is itself untracked."""
+    stripped = _strip_untracked(value, untracked_ids, {})
+    return value if stripped is _REMOVED else stripped
+
+
 def sanitize_untracked_values_in_send(
-    packet: Send, channels: Mapping[str, BaseChannel]
+    packet: Send,
+    channels: Mapping[str, BaseChannel],
+    untracked_ids: set[int] | None = None,
 ) -> Send:
     """Pop any values belonging to UntrackedValue channels in Send.arg for safe checkpointing.
 
     Send is often called with state to be passed to the dest node, which may contain
-    UntrackedValues at the top level. Send is not typed and arg may be a nested dict."""
+    UntrackedValues at the top level or nested inside mappings/sequences. Send is not
+    typed, so arg may be any object.
 
-    if not isinstance(packet.arg, dict):
-        # Command
-        return packet
+    Top-level keys are matched against channel names (legacy behavior); nested values
+    are matched by identity so that nested mappings reusing the same key still survive.
+    """
+    if untracked_ids is None:
+        untracked_ids = _untracked_value_ids(channels)
 
-    # top level keys should be the channel names
-    sanitized_arg = {
-        k: v
-        for k, v in packet.arg.items()
-        if not isinstance(channels.get(k), UntrackedValue)
-    }
-    return Send(node=packet.node, arg=sanitized_arg, timeout=packet.timeout)
+    arg = packet.arg
+    if isinstance(arg, dict):
+        # top level keys should be the channel names
+        arg = {
+            k: v
+            for k, v in arg.items()
+            if not isinstance(channels.get(k), UntrackedValue)
+        }
+    if untracked_ids:
+        arg = _sanitize_untracked_value(arg, untracked_ids)
+    return Send(node=packet.node, arg=arg, timeout=packet.timeout)

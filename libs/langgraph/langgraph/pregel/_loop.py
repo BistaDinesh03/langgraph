@@ -73,7 +73,7 @@ from langgraph.channels.base import BaseChannel
 from langgraph.channels.binop import _get_overwrite
 from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.untracked_value import UntrackedValue
-from langgraph.constants import TAG_HIDDEN
+from langgraph.constants import START, TAG_HIDDEN
 from langgraph.errors import (
     EmptyInputError,
     GraphInterrupt,
@@ -86,6 +86,9 @@ from langgraph.pregel._algo import (
     Call,
     GetNextVersion,
     PregelTaskWrites,
+    _sanitize_untracked_value,
+    _untracked_value_ids,
+    _untracked_value_ids_from_writes,
     apply_writes,
     checkpoint_null_version,
     increment,
@@ -165,6 +168,25 @@ def _cacheable(writes: WritesT) -> bool:
     # A cache hit skips the node, so a cached error would skip it without
     # raising: only a node that finished goes to the cache.
     return not any(c in (INTERRUPT, ERROR) for c, _ in writes)
+
+
+def _untracked_value_ids_from_input(
+    input_value: Any, channels: Mapping[str, BaseChannel]
+) -> set[int]:
+    """Ids of input values written to UntrackedValue channels.
+
+    A subgraph's input checkpoint is saved before the START node fans the input
+    out into state channels, so its UntrackedValue channels are still empty at
+    that point. The raw input's top-level keys are channel names, which lets us
+    identify the untracked values anyway.
+    """
+    if not isinstance(input_value, Mapping):
+        return set()
+    return {
+        id(value)
+        for key, value in input_value.items()
+        if isinstance(channels.get(key), UntrackedValue)
+    }
 
 
 class PregelLoop:
@@ -497,11 +519,21 @@ class PregelLoop:
         if any(
             isinstance(channel, UntrackedValue) for channel in self.channels.values()
         ):
+            untracked_ids = (
+                _untracked_value_ids(self.channels)
+                | _untracked_value_ids_from_writes(writes, self.specs)
+                | _untracked_value_ids_from_input(self.input, self.channels)
+            )
             # we do not persist untracked values in checkpoints
             writes_to_save = [
                 # sanitize UntrackedValues that are nested within Send packets
                 (
-                    (c, sanitize_untracked_values_in_send(v, self.channels))
+                    (
+                        c,
+                        sanitize_untracked_values_in_send(
+                            v, self.channels, untracked_ids
+                        ),
+                    )
                     if c == TASKS and isinstance(v, Send)
                     else (c, v)
                 )
@@ -1314,17 +1346,6 @@ class PregelLoop:
             self.checkpoint_metadata["counters_since_delta_snapshot"] = non_zero
         elif "counters_since_delta_snapshot" in self.checkpoint_metadata:
             del self.checkpoint_metadata["counters_since_delta_snapshot"]
-        # sanitize TASK channel in the checkpoint before saving (durability=="exit")
-        if TASKS in self.checkpoint["channel_values"] and any(
-            isinstance(channel, UntrackedValue) for channel in self.channels.values()
-        ):
-            sanitized_tasks = [
-                sanitize_untracked_values_in_send(value, self.channels)
-                if isinstance(value, Send)
-                else value
-                for value in self.checkpoint["channel_values"][TASKS]
-            ]
-            self.checkpoint["channel_values"][TASKS] = sanitized_tasks
         # bail if no checkpointer
 
         if do_checkpoint and self._checkpointer_put_after_previous is not None:
@@ -1354,6 +1375,33 @@ class PregelLoop:
             # and can start out of order, so a save that took them itself
             # could get another checkpoint's writes.
             delta_write_futs, self._delta_write_futs = self._delta_write_futs, []
+            checkpoint_to_save = copy_checkpoint(self.checkpoint)
+            # Values belonging to UntrackedValue channels must not reach the
+            # checkpointer. The live checkpoint keeps the raw values: nodes and
+            # subgraphs may still need them at runtime. Sanitize the shallow
+            # copy handed to the saver instead. This also covers the "__start__"
+            # channel, which holds a subgraph's raw input when a Send targets it.
+            if any(
+                isinstance(channel, UntrackedValue)
+                for channel in self.channels.values()
+            ):
+                untracked_ids = _untracked_value_ids(self.channels) | (
+                    _untracked_value_ids_from_input(self.input, self.channels)
+                )
+                channel_values = checkpoint_to_save["channel_values"]
+                if TASKS in channel_values:
+                    channel_values[TASKS] = [
+                        sanitize_untracked_values_in_send(
+                            value, self.channels, untracked_ids
+                        )
+                        if isinstance(value, Send)
+                        else value
+                        for value in channel_values[TASKS]
+                    ]
+                if untracked_ids and START in channel_values:
+                    channel_values[START] = _sanitize_untracked_value(
+                        channel_values[START], untracked_ids
+                    )
             # save it, without blocking
             # if there's a previous checkpoint save in progress, wait for it
             # ensuring checkpointers receive checkpoints in order
@@ -1362,7 +1410,7 @@ class PregelLoop:
                 getattr(self, "_put_checkpoint_fut", None),
                 delta_write_futs,
                 self.checkpoint_config,
-                copy_checkpoint(self.checkpoint),
+                checkpoint_to_save,
                 self.checkpoint_metadata,
                 new_versions,
             )

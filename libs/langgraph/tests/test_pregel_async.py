@@ -6,6 +6,7 @@ import logging
 import operator
 import random
 import sys
+import threading
 import uuid
 from collections import Counter, defaultdict, deque
 from dataclasses import replace
@@ -60,6 +61,7 @@ from langgraph.channels.binop import BinaryOperatorAggregate
 from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.last_value import LastValue
 from langgraph.channels.topic import Topic
+from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.errors import (
     GraphRecursionError,
     InvalidUpdateError,
@@ -2521,6 +2523,180 @@ async def test_imp_stream_order(
         {"baz": {"a": "0foobarbaz", "c": "something else"}},
         {"graph": {"a": "0foobarbaz", "c": "something else"}},
     ]
+
+
+async def test_send_with_untracked_value_nested_arg(
+    async_checkpointer: BaseCheckpointSaver, durability: Durability
+) -> None:
+    """Untracked values nested below the top level of Send.arg are not persisted."""
+
+    class UnserializableResource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.lock = threading.Lock()
+
+    class State(TypedDict):
+        messages: Annotated[list[str], operator.add]
+        metadata: dict
+        session_resource: Annotated[UnserializableResource, UntrackedValue]
+
+    def setup_node(state: State) -> State:
+        return {
+            "messages": ["setup complete"],
+            "session_resource": UnserializableResource("test_session"),
+        }
+
+    def send_to_tool(state: State):
+        resource = state["session_resource"]
+        return [
+            Send(
+                "tool_node",
+                {
+                    "messages": state["messages"],
+                    "metadata": {"session_resource": resource},
+                    "session_resource": resource,
+                },
+            )
+        ]
+
+    def tool_node(state: State) -> State:
+        resource = state["session_resource"]
+        assert isinstance(resource, UnserializableResource)
+        assert resource.name == "test_session"
+        # the runtime copy still holds the live object
+        assert state["metadata"]["session_resource"] is resource
+        return {"messages": ["tool used resource"]}
+
+    graph = StateGraph(State)
+    graph.add_node("setup", setup_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_edge(START, "setup")
+    graph.add_conditional_edges("setup", send_to_tool)
+    graph.add_edge("tool_node", END)
+
+    app = graph.compile(checkpointer=async_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = await app.ainvoke({}, config, durability=durability)
+
+    assert result["messages"] == ["setup complete", "tool used resource"]
+    assert "session_resource" not in (await app.aget_state(config)).values
+
+
+async def test_send_with_untracked_value_to_subgraph(
+    async_checkpointer: BaseCheckpointSaver, durability: Durability
+) -> None:
+    """A Send to a subgraph must not persist untracked values in its input checkpoint."""
+
+    class UnserializableResource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.lock = threading.Lock()
+
+    class State(TypedDict):
+        messages: Annotated[list[str], operator.add]
+        session_resource: Annotated[UnserializableResource, UntrackedValue]
+
+    seen: list[str] = []
+
+    def setup_node(state: State) -> State:
+        return {
+            "messages": ["setup complete"],
+            "session_resource": UnserializableResource("test_session"),
+        }
+
+    def send_to_subgraph(state: State):
+        return [Send("subgraph", state)]
+
+    subgraph = StateGraph(State)
+
+    def inner(state: State) -> State:
+        resource = state["session_resource"]
+        assert isinstance(resource, UnserializableResource)
+        seen.append(resource.name)
+        return {"messages": ["inner done"]}
+
+    subgraph.add_node("inner", inner)
+    subgraph.add_edge(START, "inner")
+    subgraph.add_edge("inner", END)
+
+    graph = StateGraph(State)
+    graph.add_node("setup", setup_node)
+    graph.add_node("subgraph", subgraph.compile())
+    graph.add_edge(START, "setup")
+    graph.add_conditional_edges("setup", send_to_subgraph)
+    graph.add_edge("subgraph", END)
+
+    app = graph.compile(checkpointer=async_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = await app.ainvoke({}, config, durability=durability)
+
+    assert seen == ["test_session"]
+    assert "inner done" in result["messages"]
+    assert "session_resource" not in (await app.aget_state(config)).values
+
+
+async def test_send_with_untracked_value_overlapping_keys_nested(
+    async_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Nested keys that only share a channel name keep their values."""
+
+    class UnserializableResource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.lock = threading.Lock()
+
+    class State(TypedDict):
+        dictionary: dict
+        session_resource: Annotated[UnserializableResource, UntrackedValue]
+
+    def setup_node(state: State) -> State:
+        return {"session_resource": UnserializableResource("test_session")}
+
+    def send_to_tool(state: State):
+        resource = state["session_resource"]
+        return [
+            Send(
+                "tool_node",
+                {
+                    "dictionary": {
+                        "session_resource": "legal_value",
+                        "nested": {"session_resource": "also_legal"},
+                        "live": resource,
+                    },
+                    "session_resource": resource,
+                },
+            )
+        ]
+
+    def tool_node(state: State) -> State:
+        resource = state["session_resource"]
+        assert state["dictionary"]["session_resource"] == "legal_value"
+        assert state["dictionary"]["nested"] == {"session_resource": "also_legal"}
+        assert state["dictionary"]["live"] is resource
+        return {
+            "dictionary": {
+                "session_resource": "legal_value",
+                "nested": {"session_resource": "also_legal"},
+            }
+        }
+
+    graph = StateGraph(State)
+    graph.add_node("setup", setup_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_edge(START, "setup")
+    graph.add_conditional_edges("setup", send_to_tool)
+    graph.add_edge("tool_node", END)
+
+    app = graph.compile(checkpointer=async_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    await app.ainvoke({}, config)
+
+    values = (await app.aget_state(config)).values
+    assert values["dictionary"] == {
+        "session_resource": "legal_value",
+        "nested": {"session_resource": "also_legal"},
+    }
+    assert "session_resource" not in values
 
 
 @pytest.mark.skipif(
